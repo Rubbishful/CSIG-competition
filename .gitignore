@@ -1,7 +1,6 @@
 __pycache__
 /exps
 /runs
-/data
 /.gradio
 /.idea
 /temp
@@ -11,3 +10,15 @@ __pycache__
 /.cog
 /output.png
 /results
+
+# IDE
+.reasonix
+
+# Data
+/data
+
+# Model
+/HYPIR_model
+
+# OS
+.DS_Store
