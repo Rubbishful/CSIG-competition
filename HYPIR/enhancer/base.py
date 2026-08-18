@@ -7,7 +7,6 @@ from PIL import Image
 from diffusers import AutoencoderKL
 
 from HYPIR.utils.common import wavelet_reconstruction, make_tiled_fn
-from HYPIR.utils.tiled_vae import enable_tiled_vae
 
 
 class BaseEnhancer:
