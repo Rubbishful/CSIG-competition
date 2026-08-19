@@ -11,6 +11,9 @@ __pycache__
 /output.png
 /results
 
+# 评估输出(生成物)
+/evaluate_output
+
 # IDE
 .reasonix
 
