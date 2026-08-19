@@ -29,6 +29,8 @@ HYPIR/
 ├── configs/                   # 训练/推理配置（sd2_train.yaml、sd2_gradio.yaml）
 ├── Data/                      # 数据（详见下文）
 ├── doc/                       # 分析文档（初步分析.md）
+├── evaluate_tool/             # 批量评估工具链（paired 成对 / nr 无参考）
+├── evaluate_output/           # 评估结果输出（CSV/JSON，gitignore）
 ├── examples/                  # 推理示例（lq/、prompt/）
 ├── train.py                   # 训练入口
 ├── test.py                    # 批量推理入口（tiled patch）
@@ -44,10 +46,10 @@ Data/
 ├── 102flowers/          8189 张（花朵）
 ├── CUB_200_2011/        11788 张（鸟类）
 ├── WIDER_train/         12880 张（场景/人脸）
-├── 赛题一/              比赛数据
-│   ├── 测试集/          100 张 LQ（无 GT，4K）
-│   ├── 验证集/          10 对 GT/LQ（4K 同尺寸）
-│   └── Result/          推理结果输出
+├── competition/              比赛数据
+│   ├── test/          100 张 LQ（无 GT，4K）
+│   ├── evaluate/          5 对 GT/LQ（case1-5，4K 同尺寸）
+│   └── Result/          推理结果输出（每轮独立文件夹）
 └── check_images.py      图片质量检查脚本（数量/分辨率/损坏检测）
 ```
 
@@ -68,11 +70,26 @@ Data/
 
 ### 图像评估
 
-| 工具 | 作用 |
-|---|---|
-| `Data/check_images.py` | 批量检查图片数量、分辨率分布、损坏文件（数据质量把关） |
-| 退化指纹分析（方法见 [doc/初步分析.md](doc/初步分析.md)） | 对赛题验证集 10 对 GT/LQ 做残差结构分析（残差 RMS / 高频占比 / 边缘-平坦残差 / 偏色量），量化退化构成，用于**校准合成退化参数** |
-| 测试集评估 | 赛题测试集 100 张无 GT → NR-IQA（MANIQA/MUSIQ/NIQE）相对提升；验证集 10 对 → PSNR/SSIM/LPIPS/DISTS 客观指标 |
+评估工具链位于 [`evaluate_tool/`](evaluate_tool/)，提供 **paired（成对，有 GT）** 与 **nr（无参考，无 GT）** 两种批量模式，输出 CSV 明细 + JSON 汇总 + 控制台表格。
+
+```shell
+# 成对评估：GT vs 恢复结果（PSNR/SSIM/LPIPS + 残差指纹 + 退化构成画像）
+# --lq-dir 提供时额外输出 LQ→结果 的退化构成变化（delta_rms / delta_cast）
+python -m evaluate_tool.analyze paired \
+    --gt-dir Data/competition/evaluate --pred-dir Data/competition/Result/<run> \
+    --lq-dir Data/competition/evaluate --out-dir evaluate_output/run_vs_gt
+
+# 无参考评估：NIQE（本地参数）/ MANIQA / MUSIQ（本地权重）+ 单图退化指纹
+# --dir2 提供时按序号配对输出指标相对提升（delta_*）
+python -m evaluate_tool.analyze nr \
+    --dir Data/competition/test --dir2 Data/competition/Result/<run> \
+    --metric niqe,maniqa,musiq
+```
+
+- **paired**：全参考指标 PSNR/SSIM/LPIPS（LPIPS 自动缩放最长边到 1024 控制 4K 开销）+ 残差结构指纹（残差 RMS / 高频占比 / 边缘-平坦残差 / 通道偏色量，方法见 [doc/初步分析.md](doc/初步分析.md) 实验 4），并给出**退化构成画像**：严重度（轻/中/重度，按残差 RMS）+ 退化成分组合（模糊/噪声/偏色/边缘伪影独立判定，支持混合，如"重度·模糊+偏色"）+ 结构主导成分（模糊/噪声/边缘伪影中分数最高者——对恢复任务结构退化比偏色更本质）。
+- **nr**：NR-IQA 指标默认 `NIQE`（内置实现，无需下载）；`MANIQA`/`MUSIQ` 使用本地权重 `HYPIR_model/MANIQA.pt`、`HYPIR_model/MUSIQ.pth`，NIQE 参数文件 `HYPIR_model/niqe_modelparameters.mat`（均需提前放置，不会运行时联网下载）。
+- 文件名按数字序号自动配对（`case1_gt.jpg` ↔ `case-1.png` ↔ `case1_lq.jpg`），目录混放 GT/LQ 时用 `--gt-suffix _gt` / `--lq-suffix _lq` 区分。
+- `Data/check_images.py` 负责数据质量把关（数量/分辨率/损坏检测）。
 
 ## 安装
 
@@ -90,23 +107,21 @@ pip install -r requirements.txt
 
 ### 批量推理（test.py）
 
+模型参数默认从 `configs/sd2_gradio.yaml` 读取（命令行显式指定时覆盖）；默认输入赛题测试集、默认输出到 Result 下自动编号的独立文件夹：
+
 ```shell
-python test.py \
---base_model_type sd2 \
---base_model_path stabilityai/stable-diffusion-2-1-base \
---model_t 200 --coeff_t 200 \
---lora_rank 256 \
---lora_modules to_k,to_q,to_v,to_out.0,conv,conv1,conv2,conv_shortcut,conv_out,proj_in,proj_out,ff.net.2,ff.net.0.proj \
---weight_path HYPIR_model/HYPIR_sd2.pth \
---patch_size 512 --stride 256 \
---lq_dir Data/赛题一/测试集 \
---scale_by factor --upscale 1 \
---output_dir Data/赛题一/Result \
---seed 231 --device cuda
+# 赛题默认链路：输入 Data/competition/test，输出 Data/competition/Result/<YYYY-MM-DD-N>，
+# upscale=1（同尺寸恢复）、captioner=empty（无提示词）、patch 512/stride 256
+python test.py
+
+# 自定义：指定输出文件夹名 / 输入目录 / 覆盖模型参数
+python test.py --run_name my-run --lq_dir /path/to/images --upscale 1 \
+    --lora_rank 256 --patch_size 512 --stride 256 --device cuda
 ```
 
-- 赛题一为同尺寸恢复，使用 `--upscale 1`（如需超分可调整）。
-- 4K 大图由 `patch_size`/`stride` 的 tiled 方式自动分块处理。
+- 赛题一为同尺寸恢复，`--upscale` 默认 1（如需超分可调整）。
+- 模型参数（`--base_model_path`/`--model_t`/`--coeff_t`/`--lora_rank`/`--lora_modules`/`--weight_path`）默认取 `configs/sd2_gradio.yaml`，命令行传参即覆盖。
+- 4K 大图由 `patch_size`/`stride` 的 tiled 方式自动分块处理；结果保存到 `<output>/result/`，prompt 保存到 `<output>/prompt/`。
 
 ### Gradio 演示（app.py）
 
