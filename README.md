@@ -1,227 +1,142 @@
-<p align="center">
-    <img src="assets/logo.png" width="400">
-</p>
+# HYPIR 本地图像恢复项目
 
-## HYPIR: Harnessing Diffusion-Yielded Score Priors for Image Restoration
+基于 [HYPIR](https://arxiv.org/abs/2507.20590)（Harnessing Diffusion-Yielded Score Priors for Image Restoration，HYPIR-SD2）的本地图像恢复项目，用于**华为手机摄影比赛（赛题一）**的同尺寸 4K 图像恢复增强：在 HYPIR-SD2 预训练权重基础上继续 LoRA 微调，聚焦钟表、花朵等纹理细节丰富的场景。
 
-[Paper](https://arxiv.org/abs/2507.20590) | [Project Page](https://hypir.xpixel.group/) | [Project Page (CN)](https://hypirzh.xpixel.group/)
+## 目录
 
-![visitors](https://visitor-badge.laobi.icu/badge?page_id=XPixelGroup/HYPIR) [![Try a demo on Replicate](https://replicate.com/0x3f3f3f3fun/hypir-sd2/badge)](https://replicate.com/0x3f3f3f3fun/hypir-sd2) [![Open in OpenXLab](https://cdn-static.openxlab.org.cn/app-center/openxlab_app.svg)](https://openxlab.org.cn/apps/detail/linxinqi/HYPIR-SD2) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1MbpICKc22S6ysD32uj3ORkqg6AgZrNpx?usp=sharing)
+- [项目结构](#项目结构)
+- [数据](#数据)
+- [数据生成与评估工作流](#数据生成与评估工作流)
+- [安装](#安装)
+- [推理](#推理)
+- [训练](#训练)
+- [相关文档](#相关文档)
 
-[Xinqi Lin](https://0x3f3f3f3fun.github.io/)<sup>1,2</sup>, [Fanghua Yu](https://github.com/Fanghua-Yu)<sup>1</sup>, [Jinfan Hu](https://j-fhu.github.io/)<sup>1,2</sup>, [Zhiyuan You](https://zhiyuanyou.github.io/)<sup>1,3</sup>, [Wu Shi](https://scholar.google.com/citations?user=pTH7MA4AAAAJ)<sup>1</sup>, [Jimmy S. Ren](https://www.jimmyren.com/)<sup>4,5</sup>, [Jinjin Gu](https://www.jasongt.com/)<sup>6,\*</sup>, [Chao Dong](https://scholar.google.com.hk/citations?user=OSDCB0UAAAAJ)<sup>1,7,\*</sup>
+## 项目结构
 
-\*: Corresponding author
+```text
+HYPIR/
+├── HYPIR/                     # 核心代码
+│   ├── dataset/               # 数据加载与在线退化合成（GT→LQ，无需预存数据对）
+│   │   ├── realesrgan.py      #   RealESRGANDataset：二阶退化数据集
+│   │   ├── batch_transform.py #   RealESRGANBatchTransform：退化变换流水线
+│   │   ├── diffjpeg.py        #   可微 JPEG 压缩
+│   │   └── file_backend.py    #   文件读取后端
+│   ├── enhancer/              # 推理增强器 SD2Enhancer（tiled 大图处理）
+│   ├── model/                 # 判别器 D 与骨干网络
+│   ├── trainer/               # 训练器 SD2Trainer（LoRA + GAN/LPIPS/L2 + EMA）
+│   └── utils/                 # degradation.py 退化核心、captioner、ema 等
+├── configs/                   # 训练/推理配置（sd2_train.yaml、sd2_gradio.yaml）
+├── Data/                      # 数据（详见下文）
+├── doc/                       # 分析文档（初步分析.md）
+├── examples/                  # 推理示例（lq/、prompt/）
+├── train.py                   # 训练入口
+├── test.py                    # 批量推理入口（tiled patch）
+├── app.py / app_openxlab.py   # Gradio / OpenXLab 演示
+├── predict.py                 # Cog 推理接口
+└── save_model.py              # 权重保存
+```
 
-<sup>1</sup>Shenzhen Institutes of Advanced Technology, Chinese Academy of Sciences<br><sup>2</sup>University of Chinese Academy of Sciences<br><sup>3</sup>The Chinese University of Hong Kong<br><sup>4</sup>SenseTime Research<br><sup>5</sup>Hong Kong Metropolitan University<br><sup>6</sup>INSAIT, Sofia University<br><sup>7</sup>Shenzhen University of Advanced Technology
+## 数据
 
-<table >
-  <tbody>
-    <tr align="center">
-      <td><img src="assets/inst_logos/siat.png"/ style="height:40px;"></td>
-      <td><img src="assets/inst_logos/cuhk.png" style="height:40px;"/></td>
-      <td><img src="assets/inst_logos/hkmu.png" style="height:40px;"/></td>
-      <td><img src="assets/inst_logos/insait.png" style="height:40px;"/></td>
-      <td><img src="assets/inst_logos/suat.png" style="height:40px;"/></td>
-    </tr>
-  </tbody>
-</table>
+```text
+Data/
+├── 102flowers/          8189 张（花朵）
+├── CUB_200_2011/        11788 张（鸟类）
+├── WIDER_train/         12880 张（场景/人脸）
+├── 赛题一/              比赛数据
+│   ├── 测试集/          100 张 LQ（无 GT，4K）
+│   ├── 验证集/          10 对 GT/LQ（4K 同尺寸）
+│   └── Result/          推理结果输出
+└── check_images.py      图片质量检查脚本（数量/分辨率/损坏检测）
+```
 
-<p align="center">
-    <img src="assets/teaser.png">
-</p>
+- 训练集共约 3.3 万张，均为清晰图，分辨率不一（非 512x512），训练时随机裁剪处理。
+- 赛题一为**同尺寸 4K 恢复**（非超分），LQ 视为手机光学 + ISP 矫正后的图像（数码变焦/超分算法噪声、抖动等），退化类型多样。
 
-:star:If HYPIR is helpful for you, please help star this repo. Thanks!:hugs:
+## 数据生成与评估工作流
 
-## :book:Contents
+### 数据生成：在线合成退化（无需预存 LQ 对）
 
-- [What's Next](#next)
-- [Gallery](#gallery)
-- [Update](#update)
-- [Installation](#installation)
-- [Pretrained Models](#pretrained_models)
-- [Quick Start](#quick_start)
-- [Inference](#inference)
-- [Train](#train)
+本项目训练**不需要预先准备"清晰图-模糊图"数据对**。`RealESRGANDataset`（[HYPIR/dataset/realesrgan.py](HYPIR/dataset/realesrgan.py)）+ `RealESRGANBatchTransform`（[HYPIR/dataset/batch_transform.py](HYPIR/dataset/batch_transform.py)）在训练时**即时从 GT 合成 LQ**，采用 Real-ESRGAN 风格的**二阶退化**：
 
-## <a name="next"></a>:soon:What's Next
+1. 第一阶：随机模糊核（iso/aniso/generalized_iso/generalized_aniso/plateau_iso/plateau_aniso 六种）+ sinc 振铃 + resize + 高斯/泊松噪声 + JPEG 压缩
+2. 第二阶：对退化图再叠加一轮退化，并按下采样倍率缩放（`stage2_scale`）
+3. 全部退化参数在 `configs/sd2_train.yaml` 的 `data_config` 中配置
 
-**Our current open-source version** is based on the Stable Diffusion 2.1. While the number of parameters is small, this model was trained on our best-quality data and with significant computational resources (batch size 1024). Therefore, its performance is also quite good. Some examples [here](#gallery).
+> 针对本赛题手机摄影场景（数码变焦/ISP 矫正/抖动：模糊 + 噪声 + 偏色 + 重采样伪影的混合退化）的合成管线定制分析见 [doc/初步分析.md](doc/初步分析.md)。
 
-**Our most advanced model** has been launched on [suppixel.ai](https://supir.suppixel.ai/home) and [suppixel.cn](https://www.suppixel.cn/home)!🔥🔥🔥 We welcome you to experience it. This state-of-the-art model offers **more stable results**, **more flexible capabilities**, while still maintaining **incredibly fast speeds**.
+### 图像评估
 
-⚠️⚠️⚠️The following website is not under our operation. They do not have a license for our model and have used several of our comparison images without our permission. Please verify the legitimacy of any site to prevent financial loss.
-- https://www.hypir.org/
+| 工具 | 作用 |
+|---|---|
+| `Data/check_images.py` | 批量检查图片数量、分辨率分布、损坏文件（数据质量把关） |
+| 退化指纹分析（方法见 [doc/初步分析.md](doc/初步分析.md)） | 对赛题验证集 10 对 GT/LQ 做残差结构分析（残差 RMS / 高频占比 / 边缘-平坦残差 / 偏色量），量化退化构成，用于**校准合成退化参数** |
+| 测试集评估 | 赛题测试集 100 张无 GT → NR-IQA（MANIQA/MUSIQ/NIQE）相对提升；验证集 10 对 → PSNR/SSIM/LPIPS/DISTS 客观指标 |
 
-## <a name="gallery"></a>:eyes:Gallery
-
-The following cases were upscaled by HYPIR-SD2. All resolutions are above 2k.
-
-<table >
-  <tbody>
-    <tr align="center">
-      <td><a href="https://imgsli.com/NDAzMjA5"><img src="assets/gallery_sd2/Avatar.jpg"/></a></td>
-      <td><a href="https://imgsli.com/NDAzMjEx"><img src="assets/gallery_sd2/The_Matrix.jpg" width="90%"/></a></td>
-    </tr>
-    <tr align="center">
-      <td><a href="https://imgsli.com/NDAzMjE0"><img src="assets/gallery_sd2/The_Lord_of_the Rings.jpg" width="100%"/></a><br><a href="https://imgsli.com/NDAzMjI1"><img src="assets/gallery_sd2/Coco.jpg" width="100%"/></a></td>
-      <td><a href="https://imgsli.com/NDAzMjE4"><img src="assets/gallery_sd2/Forrest_Gump.jpg" width="72%"/></a></td>
-    </tr>
-    <tr align="center">
-      <td><a href="https://imgsli.com/NDAzMjIz"><img src="assets/gallery_sd2/Dragon_Ball.jpg"/></a></td>
-      <td><a href="https://imgsli.com/NDAzMjI3"><img src="assets/gallery_sd2/Uproar_in_Heaven.jpg"/></a></td>
-    </tr>
-    <tr align="center">
-      <td><a href="https://imgsli.com/NDAzMjI0"><img src="assets/gallery_sd2/Spirited_Away.jpg"/></a></td>
-      <td><a href="https://imgsli.com/NDAzMjI5"><img src="assets/gallery_sd2/Calabash_Brothers.jpg"/></a></td>
-    </tr>
-  </tbody>
-</table>
-
-## <a name="update"></a>:new:Update
-
-- **2025.07.28**: :white_check_mark: Provide [colab](https://colab.research.google.com/drive/1MbpICKc22S6ysD32uj3ORkqg6AgZrNpx?usp=sharing) example. Free T4 GPU is good enough for running this model!
-- **2025.07.28**: :white_check_mark: Integrated to [openxlab](https://openxlab.org.cn/apps/detail/linxinqi/HYPIR-SD2).
-- **2025.07.19**: :white_check_mark: Integrated to [replicate](https://replicate.com/0x3f3f3f3fun/hypir-sd2).
-- **2025.07.19**: This repo is created.
-
-## <a name="installation"></a>:gear:Installation
+## 安装
 
 ```shell
-git clone https://github.com/XPixelGroup/HYPIR.git
-cd HYPIR
-conda create -n hypir python=3.10
-conda activate hypir
 pip install -r requirements.txt
 ```
 
-## <a name="pretrained_models"></a>:dna:Pretrained Models
+模型权重位于 `HYPIR_model/`：
 
-| Model Name | Description | HuggingFace | OpenXLab |
-| :---------: | :----------: | :----------: | :----------: |
-| HYPIR_sd2.pth | Lora weights of HYPIR-SD2 | [download](https://huggingface.co/lxq007/HYPIR/tree/main) | [download](https://openxlab.org.cn/models/detail/linxinqi/HYPIR/tree/main) |
+- `HYPIR_sd2.pth`：HYPIR-SD2 的 LoRA 权重（续训/推理使用）
+- `HYPIR_sd2_D.safetensors`：判别器权重
+- `sd2-1-base/`：Stable Diffusion 2.1 base 模型（本地缓存，避免重复下载）
 
-## <a name="quick_start"></a>:flight_departure:Quick Start
+## 推理
 
-1. Download model weight `HYPIR_sd2.pth`.
-
-2. Fill `weight_path` in [configs/sd2_gradio.yaml](configs/sd2_gradio.yaml).
-
-3. Run the following command to launch gradio.
-
-    ```shell
-    python app.py --config configs/sd2_gradio.yaml --local --device cuda
-    ```
-4. (Optional) Tired of manually typing out prompts for your images? Let GPT do the work for you!
-
-    First, create a file named `.env` in the project directory.
-
-    ```conf
-    GPT_API_KEY=your-awesome-api-key
-    GPT_BASE_URL=openai-gpt-base-url
-    GPT_MODEL=gpt-4o-mini
-    ```
-
-    Second, add your API base URL and API key in the `.env` file. For the model, 4o-mini is usually sufficient.
-
-    Finally, pass `--gpt_caption` argument to the program, and type "auto" in the prompt box to use GPT-generated prompt.
-
-<div align="center">
-    <kbd><img src="assets/gradio.png"></img></kbd>
-</div>
-
-## <a name="inference"></a>:crossed_swords:Inference
-
-More details can be found by running `python test.py --help`.
+### 批量推理（test.py）
 
 ```shell
-LORA_MODULES_LIST=(to_k to_q to_v to_out.0 conv conv1 conv2 conv_shortcut conv_out proj_in proj_out ff.net.2 ff.net.0.proj)
-IFS=','
-LORA_MODULES="${LORA_MODULES_LIST[*]}"
-unset IFS
-
 python test.py \
 --base_model_type sd2 \
 --base_model_path stabilityai/stable-diffusion-2-1-base \
---model_t 200 \
---coeff_t 200 \
+--model_t 200 --coeff_t 200 \
 --lora_rank 256 \
---lora_modules $LORA_MODULES \
---weight_path path/to/HYPIR_sd2.pth \
---patch_size 512 \
---stride 256 \
---lq_dir examples/lq \
---scale_by factor \
---upscale 4 \
---txt_dir examples/prompt \
---output_dir results/examples \
---seed 231 \
---device cuda
+--lora_modules to_k,to_q,to_v,to_out.0,conv,conv1,conv2,conv_shortcut,conv_out,proj_in,proj_out,ff.net.2,ff.net.0.proj \
+--weight_path HYPIR_model/HYPIR_sd2.pth \
+--patch_size 512 --stride 256 \
+--lq_dir Data/赛题一/测试集 \
+--scale_by factor --upscale 1 \
+--output_dir Data/赛题一/Result \
+--seed 231 --device cuda
 ```
 
-## <a name="train"></a>:stars:Train
+- 赛题一为同尺寸恢复，使用 `--upscale 1`（如需超分可调整）。
+- 4K 大图由 `patch_size`/`stride` 的 tiled 方式自动分块处理。
 
-1. Generate a parquet file to save both image paths and prompts. For example:
+### Gradio 演示（app.py）
+
+```shell
+python app.py --config configs/sd2_gradio.yaml --local --device cuda
+```
+
+## 训练
+
+在 HYPIR-SD2 预训练 LoRA 权重（`HYPIR_model/HYPIR_sd2.pth`，`lora_rank=256`）基础上继续微调。
+
+1. 生成训练数据索引文件（parquet，含图片路径与 prompt）：
 
     ```python
-    import os
     import polars as pl
-    # Recursively collect image files. For example, you can crop 
-    # the LSDIR dataset into 512x512 patches and place all patches 
-    # in one folder.
-    image_dir = "/opt/data/common/data260t/LSDIR_512"
-    image_exts = (".jpg", ".jpeg", ".png")
-    image_paths = []
-    for root, dirs, files in os.walk(image_dir):
-        for file in files:
-            if file.lower().endswith(image_exts):
-                image_paths.append(os.path.join(root, file))
-    # Create dataframe object with prompts. Here we use empty 
-    # prompt for simplicity.
-    df = pl.from_dict({
-        "image_path": image_paths,
-        "prompt": [""] * len(image_paths)
-    })
-    # Save as parquet file, which will be used in the next step.
-    df.write_parquet("path/to/save/LSDIR_512_nulltxt.parquet")
+    image_paths = [...]  # 递归收集 Data/ 下所有图片路径
+    df = pl.from_dict({"image_path": image_paths, "prompt": [""] * len(image_paths)})
+    df.write_parquet("path/to/train_meta.parquet")
     ```
 
-2. Fill in the values marked as TODO in [configs/sd2_train.yaml](configs/sd2_train.yaml). For example:
+2. 填写 [configs/sd2_train.yaml](configs/sd2_train.yaml) 中的 TODO 项：`output_dir`、`file_list`、`image_path_prefix` 等（退化合成参数见上文"数据生成"）。
 
-    ```yaml
-    output_dir: /path/to/save/experiment
-    data_config:
-      train:
-        ...
-        dataset:
-          target: HYPIR.dataset.realesrgan.RealESRGANDataset
-          params:
-            file_meta:
-              file_list: path/to/LSDIR_512_nulltxt.parquet
-              image_path_prefix: ""
-              image_path_key: image_path
-              prompt_key: prompt
-            ...
-    ```
-
-3. Start training.
+3. 启动训练：
 
     ```shell
     accelerate launch train.py --config configs/sd2_train.yaml
     ```
 
-## :email: Contact
+> 详细方案（合成管线定制、训练/评估流程）见 [doc/初步分析.md](doc/初步分析.md)。
 
-For questions about code or paper, please email `xqlin0613@gmail.com`.
+## 相关文档
 
-For authorization and collaboration inquiries, please email `jinjin.gu@suppixel.ai`.
-
-## Non-Commercial Use Only Declaration
-The HYPIR ("Software") is made available for use, reproduction, and distribution strictly for non-commercial purposes. For the purposes of this declaration, "non-commercial" is defined as not primarily intended for or directed towards commercial advantage or monetary compensation.
-
-By using, reproducing, or distributing the Software, you agree to abide by this restriction and not to use the Software for any commercial purposes without obtaining prior written permission from Dr. Jinjin Gu.
-
-This declaration does not in any way limit the rights under any open source license that may apply to the Software; it solely adds a condition that the Software shall not be used for commercial purposes.
-
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-For inquiries or to obtain permission for commercial use, please contact Dr. Jinjin Gu (jinjin.gu@suppixel.ai).
+- [doc/初步分析.md](doc/初步分析.md)：数据统计、退化指纹实验、合成数据/训练/评估方案与决策记录。
