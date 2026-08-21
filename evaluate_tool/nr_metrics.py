@@ -102,22 +102,28 @@ class NRMetricSet:
                 if not MANIQA_PATH.exists():
                     raise FileNotFoundError(f"缺少 MANIQA 权重: {MANIQA_PATH}")
                 path = _prepare_maniqa(MANIQA_PATH)
+                # MANIQA 架构内部调用 timm.create_model('vit_base_patch8_224', pretrained=True),
+                # 会尝试联网下载 timm 预训练权重(HF)。但 MANIQA.pt 自带完整 vit 权重,
+                # strict 加载会整体覆盖,下载纯属浪费;且无网环境(如云服务器)下会卡在
+                # huggingface_hub 的网络重试上。故 monkey-patch 强制 pretrained=False
+                # (随机初始化,零网络依赖),随后由 MANIQA.pt 覆盖,指标不受影响。
+                import timm as _timm
+
+                _orig_create_model = _timm.create_model
+
+                def _no_pretrained(*args, **kwargs):
+                    kwargs["pretrained"] = False
+                    return _orig_create_model(*args, **kwargs)
+
+                _timm.create_model = _no_pretrained
                 try:
-                    # 离线加载: 避免 timm vit 权重的联网下载重试(~90s)噪音;
-                    # MANIQA.pt 自带完整 vit 权重,下载失败降级随机初始化后会被覆盖,不影响指标。
                     with _offline_hf():
                         self._metrics[name] = pyiqa.create_metric(
                             "maniqa", device=self.device,
                             pretrained_model_path=str(path),
                         )
-                except Exception:
-                    # 个别 timm 版本在 HF_HUB_OFFLINE=1 下直接抛异常而非降级,
-                    # 此时回退在线模式重试一次(行为与优化前一致)。
-                    print("[nr] MANIQA 离线加载失败,回退在线模式重试一次 ...")
-                    self._metrics[name] = pyiqa.create_metric(
-                        "maniqa", device=self.device,
-                        pretrained_model_path=str(path),
-                    )
+                finally:
+                    _timm.create_model = _orig_create_model
                 self._input_size["maniqa"] = 448  # MANIQA 固定输入
             elif name == "musiq":
                 if not MUSIQ_PATH.exists():

@@ -5,7 +5,7 @@
         --pred-dir Data/competition/Result/2026-08-18-1 \
         --lq-dir Data/competition/evaluate --out-dir evaluate_output/paired_xxx
     python -m evaluate_tool.analyze nr --dir Data/competition/test \
-        --dir2 Data/competition/Result/2026-08-18-1 --metric niqe
+        --dir2 Data/competition/Result/2026-08-18-1 --metric niqe,maniqa,musiq
 """
 
 from __future__ import annotations
@@ -279,8 +279,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_nr = sub.add_parser("nr", help="无参考评估: NIQE/MANIQA/MUSIQ + 单图退化指纹")
     p_nr.add_argument("--dir", required=True, help="待评估图像目录(如测试集或结果目录)")
     p_nr.add_argument("--dir2", default=None, help="可选: 对比目录(按序号配对,输出指标相对提升 delta)")
-    p_nr.add_argument("--metric", default="niqe",
-                      help="逗号分隔指标: niqe / maniqa / musiq(默认 niqe;"
+    p_nr.add_argument("--metric", default="niqe,maniqa,musiq",
+                      help="逗号分隔指标: niqe / maniqa / musiq(默认 niqe,maniqa,musiq全部启用;"
                            "maniqa/musiq 需要本地权重 HYPIR_model/MANIQA.pt、MUSIQ.pth)")
     p_nr.add_argument("--device", default=None, help="cuda/cpu(默认自动)")
     p_nr.add_argument("--limit", type=int, default=None, help="只评估前 N 张(调试用)")
