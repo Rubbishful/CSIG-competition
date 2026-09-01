@@ -1,0 +1,55 @@
+# 固定参考相机配置（基线版，华为 P60 Pro）
+# 参考：UPI §3.3-3.7
+
+# 正向 CCM (Camera RAW -> sRGB), 运行时求逆
+forward_ccm:
+  - [1.8415, -0.7228, -0.1186]
+  - [-0.8335, 2.1192, -0.2856]
+  - [0.1287, -0.8627, 1.7340]
+
+# Tone Mapping 配置（smoothstep）
+isp:
+  tone_mapping:
+    mode: smoothstep
+
+# 正向 ISP 配置
+forward_isp:
+  white_balance:
+    r_gain_range: [2.2, 2.5]      # 基准区间，扰动以中点为中心
+    b_gain_range: [2.4, 2.8]
+    g_gain: 1.0
+    perturbation_prob: 0.5
+    perturbation_range: [-0.05, 0.05]
+  color_correction:
+    base_matrix:
+      - [1.8415, -0.7228, -0.1186]
+      - [-0.8335, 2.1192, -0.2856]
+      - [0.1287, -0.8627, 1.7340]
+    perturbation_prob: 0.3
+    perturbation_range: 0.02
+  color_cast:
+    prob: 0.5
+    offset_range: [-0.04, 0.04]
+    affected_channels: ["r", "g", "b"]
+  sharpening:
+    prob: 0.7
+    amount_range: [0.1, 0.5]
+    radius: 1
+  vignetting:
+    prob: 0.3
+    strength_range: [0.0, 0.2]
+
+# 传感器噪声基准
+sensor:
+  beta_1_ref: 1.0e-5
+  beta_2_ref: 1.0e-5
+  beta_sample_factor: [0.5, 1.5]
+  chroma_noise:
+    enable: true
+    prob: 0.3
+    sigma_range: [0.001, 0.010]
+  dark_region_noise_boost:
+    enable: true
+    prob: 0.4
+    luminance_threshold: 0.20
+    beta_2_boost_range: [1.0, 2.0]

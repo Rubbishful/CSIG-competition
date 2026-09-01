@@ -1,0 +1,95 @@
+# 基线场景退化合成管线主配置（configs/degradation_baseline.yaml）
+# 参考：BSRGAN §3.4, UPI §3.1
+
+preprocess_version: "v2.0"
+manifest_dir: "."  # manifest 所在目录，用于路径解析
+
+scheduler:
+  mode: constrained_shuffle
+  num_cached_sequences: 500
+  seed: 42
+  constraints:
+    - {from: motion_blur, before: sensor_noise}
+    - {from: sensor_noise, before: forward_isp}
+    - {from: forward_isp, before: zoom_jpeg}
+    - {from: zoom_jpeg, before: flare}
+
+motion_blur:
+  prob: 0.3
+  length_range: [2, 100]
+  short_length_threshold: 10
+  full_angle_length: 70
+  legal_angles_path: "motion_blur_legal_angles.json"
+
+sensor:
+  beta_1_ref: 1.0e-5
+  beta_2_ref: 1.0e-5
+  beta_sample_factor: [0.5, 1.5]
+  chroma_noise:
+    enable: true
+    prob: 0.3
+    sigma_range: [0.001, 0.010]
+  dark_region_noise_boost:
+    enable: true
+    prob: 0.4
+    luminance_threshold: 0.20
+    beta_2_boost_range: [1.0, 2.0]
+
+isp:
+  tone_mapping:
+    mode: smoothstep
+
+forward_isp:
+  white_balance:
+    r_gain_range: [2.2, 2.5]
+    b_gain_range: [2.4, 2.8]
+    g_gain: 1.0
+    perturbation_prob: 0.5
+    perturbation_range: [-0.05, 0.05]
+  color_correction:
+    base_matrix:
+      - [1.8415, -0.7228, -0.1186]
+      - [-0.8335, 2.1192, -0.2856]
+      - [0.1287, -0.8627, 1.7340]
+    perturbation_prob: 0.3
+    perturbation_range: 0.02
+  color_cast:
+    prob: 0.5
+    offset_range: [-0.04, 0.04]
+    affected_channels: ["r", "g", "b"]
+  sharpening:
+    prob: 0.7
+    amount_range: [0.1, 0.5]
+    radius: 1
+  vignetting:
+    prob: 0.3
+    strength_range: [0.0, 0.2]
+
+zoom:
+  prob: 0.5
+  scale_factor_range: [0.5, 0.9]
+  severe_threshold: 0.6
+  severe_prob: 0.5
+  severe_prob_when_no_blur: 0.1
+
+jpeg:
+  prob: 1.0
+  qf_range: [30, 95]
+  double_prob: 0.75
+  qf2_ratio: [0.7, 1.0]
+  grid_offset: false
+
+flare:
+  prob: 0.3
+  gate:
+    type: highlight
+    value: 0.05
+    highlight_prob: 0.8      # 高光比例高于 gate.value 时触发概率
+    default_prob: 0.2        # 否则触发概率
+  intensity_range: [0.3, 1.0]
+  blend_mode: screen
+
+distribution_validation:
+  samples: 175
+  min_samples_per_level: 175
+  noise_levels: [0, 0.001, 0.01, 0.1]
