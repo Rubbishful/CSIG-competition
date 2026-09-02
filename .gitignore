@@ -14,6 +14,9 @@ __pycache__
 # 评估输出(生成物)
 /evaluate_output
 
+# 本地冒烟测试
+/smoke
+
 # IDE
 .reasonix
 

@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
-"""基线离线预处理入口（含 zip 批次输出模式）。
+"""基线离线预处理入口（zip 批次输出 + zip 源读取）。
 
 职责：
 - 生成 linear_raw/{name}.npy (固定参考相机逆 ISP)
+- gt_dir 支持两种源：普通目录，或未解压的 merged_512.zip（zip 源模式，直接读条目，
+  避免在系统盘解压 62GB）
 - 默认按 zip_batch_size 分批聚合成 batches/batch_XXXXX.zip（每 zip 含 linear_raw/{name}.npy，
   批次按 manifest 打乱顺序切分；npy 先写本地 staging，zip 完成后即删，避免小文件直接入 OSS）
-- 生成 preprocessed/manifest.json（zip 模式下每条记录含 'zip' 字段）
+- 生成 preprocessed/manifest.json（zip 批次模式下每条记录含 'zip' 字段；
+  zip 源模式下另有 gt_zip/gt_arc 字段，gt_path=None）
 - 生成运动模糊合法角度表 JSON
 - 生成 flare_templates/512/{id}.npy (当缺失时)
 
@@ -16,9 +19,13 @@ zip 模式设计（OSS 场景）：
   - 训练侧统一用 HYPIR.dataset.zip_store.ZipBatchStore 读取，与产物严格对应。
 
 用法示例：
-    # zip 批次模式（默认 zip_batch_size=1024，输出到 OSS 挂载目录）
+    # zip 源 + zip 批次输出（实例上，gt 直接读 OSS 上的 merged_512.zip）
+    python -m HYPIR.dataset.preprocess --gt_dir /mnt/data/merged_512.zip \
+        --output_dir /mnt/data/dataset --zip-batch-size 512 --workers 8
+
+    # 目录源 + zip 批次输出
     python -m HYPIR.dataset.preprocess --gt_dir <merged>/gt --output_dir /mnt/data/dataset \
-        --zip-batch-size 1024 --workers 8
+        --zip-batch-size 512 --workers 8
 
     # 传统松散模式（不打包，行为与旧版一致）
     python -m HYPIR.dataset.preprocess --gt_dir <gt> --output_dir <out> --zip-batch-size 0
@@ -42,6 +49,7 @@ import numpy as np
 from HYPIR.dataset.scene_degradation import (
     inverse_isp,
     load_srgb,
+    load_srgb_bytes,
     load_yaml,
     precompute_legal_angles,
     _project_root,
@@ -50,17 +58,51 @@ from HYPIR.dataset.scene_degradation import (
 # 每个 float32 512x512x3 npy 的近似大小（MB），用于 staging 峰值估算提示
 _NPY_MB = 512 * 512 * 3 * 4 / 1e6
 
+_ZIP_PREFIX = 'zip://'
+
+
+def _item_stem(item: str) -> str:
+    """GT 条目名（普通路径或 zip://<zip>!/<entry>）提取 stem。"""
+    return Path(item.split('!/')[-1]).stem
+
+
+# ---------------------------------------------------------------------------- #
+# GT 源读取（目录 / zip 通用）
+# ---------------------------------------------------------------------------- #
+
+_ZIP_CACHE = {}  # worker 进程内常驻 zip 句柄（ProcessPool 模式）
+
+
+def _get_zip(zip_path: str, use_cache: bool):
+    if not use_cache:
+        return zipfile.ZipFile(zip_path)  # 线程池回退：每次独立打开，避免共享句柄竞态
+    zf = _ZIP_CACHE.get(zip_path)
+    if zf is None:
+        zf = zipfile.ZipFile(zip_path)
+        _ZIP_CACHE[zip_path] = zf
+    return zf
+
+
+def _load_gt(item: str, zip_cache: bool) -> np.ndarray:
+    if item.startswith(_ZIP_PREFIX):
+        zip_path, entry = item[len(_ZIP_PREFIX):].split('!/', 1)
+        buf = _get_zip(zip_path, zip_cache).read(entry)
+        return load_srgb_bytes(buf)
+    return load_srgb(item)
+
 
 def _process_one(args):
-    """worker：单张 GT 逆 ISP 并保存 linear_raw。args: (gt_path, linear_raw_path, vc_fixed, cfg)"""
-    gt_path, linear_raw_path, vc_fixed, cfg = args
+    """worker：单张 GT 逆 ISP 并保存 linear_raw。
+    args: (item, linear_raw_path, vc_fixed, cfg, zip_cache)
+    """
+    item, linear_raw_path, vc_fixed, cfg, zip_cache = args
     try:
-        I_srgb = load_srgb(gt_path)
+        I_srgb = _load_gt(item, zip_cache)
         I_linear = inverse_isp(I_srgb, vc_fixed, cfg)
         np.save(linear_raw_path, I_linear)
-        return (gt_path, None)
+        return (item, None)
     except Exception as exc:
-        return (gt_path, f"{type(exc).__name__}: {exc}")
+        return (item, f"{type(exc).__name__}: {exc}")
 
 
 def _make_pool(workers: int):
@@ -73,33 +115,51 @@ def _make_pool(workers: int):
         return ThreadPoolExecutor(max_workers=workers)
 
 
-def _run_legacy(gt_files, output_dir, vc_fixed, cfg, workers):
+def _zip_cache_ok(pool) -> bool:
+    """进程池模式才能安全共享常驻 zip 句柄（每个 worker 进程一份）。"""
+    return type(pool).__name__ == 'ProcessPoolExecutor'
+
+
+# ---------------------------------------------------------------------------- #
+# 传统松散模式 / zip 批次模式
+# ---------------------------------------------------------------------------- #
+
+def _run_legacy(items, output_dir, vc_fixed, cfg, workers):
     """传统松散模式：linear_raw/*.npy 直接落盘（默认 workers=1 行为不变）。"""
     todo = []
-    for gt_path in gt_files:
-        name = Path(gt_path).stem
-        linear_raw_path = os.path.join(output_dir, 'linear_raw', f'{name}.npy')
+    for item in items:
+        stem = _item_stem(item)
+        linear_raw_path = os.path.join(output_dir, 'linear_raw', f'{stem}.npy')
         if os.path.exists(linear_raw_path):
             continue
-        todo.append((gt_path, linear_raw_path))
+        todo.append(item)
 
     failures = []
     if workers <= 1:
-        for gt_path, linear_raw_path in todo:
-            err = _process_one((gt_path, linear_raw_path, vc_fixed, cfg))[1]
+        for item in todo:
+            linear_raw_path = os.path.join(output_dir, 'linear_raw',
+                                           f'{_item_stem(item)}.npy')
+            err = _process_one((item, linear_raw_path, vc_fixed, cfg, False))[1]
             if err is not None:
-                failures.append((gt_path, err))
-                print(f"[preprocess] 处理 {Path(gt_path).name} 失败: {err}")
+                failures.append((item, err))
+                print(f"[preprocess] 处理 {_item_stem(item)} 失败: {err}")
     else:
-        jobs = [(gt_path, linear_raw_path, vc_fixed, cfg) for gt_path, linear_raw_path in todo]
+        pool = _make_pool(workers)
+        zip_cache = _zip_cache_ok(pool)
+        jobs = [(item, os.path.join(output_dir, 'linear_raw', f'{_item_stem(item)}.npy'),
+                 vc_fixed, cfg, zip_cache) for item in todo]
         print(f"[preprocess] 并行预处理 {len(jobs)} 张（workers={workers}）...")
-        with _make_pool(workers) as pool:
-            for i, (gt_path, err) in enumerate(pool.map(_process_one, jobs), 1):
-                if err is not None:
-                    failures.append((gt_path, err))
-                    print(f"[preprocess] 处理 {Path(gt_path).name} 失败: {err}")
-                if i % 20000 == 0:
-                    print(f"[preprocess]   {i}/{len(jobs)} ...")
+        if pool is not None:
+            try:
+                with pool:
+                    for i, (item, err) in enumerate(pool.map(_process_one, jobs), 1):
+                        if err is not None:
+                            failures.append((item, err))
+                            print(f"[preprocess] 处理 {_item_stem(item)} 失败: {err}")
+                        if i % 20000 == 0:
+                            print(f"[preprocess]   {i}/{len(jobs)} ...")
+            finally:
+                pool.shutdown(wait=True)
     return failures
 
 
@@ -119,7 +179,7 @@ def _zip_dir(stage_dir, zip_path, compresslevel):
             os.remove(tmp_path)
 
 
-def _run_zip_batches(gt_files, output_dir, vc_fixed, cfg, batch_size, workers,
+def _run_zip_batches(items, output_dir, vc_fixed, cfg, batch_size, workers,
                      staging_root, zip_compress, zip_workers):
     """zip 批次模式：分批本地聚合，每批一个 zip（npy 生产与 zip 打包流水线并行）。"""
     from concurrent.futures import ThreadPoolExecutor
@@ -141,13 +201,14 @@ def _run_zip_batches(gt_files, output_dir, vc_fixed, cfg, batch_size, workers,
         except zipfile.BadZipFile:
             print(f"⚠ 跳过损坏 zip: {zp}")
 
-    chunks = [gt_files[i:i + batch_size] for i in range(0, len(gt_files), batch_size)]
-    print(f"[preprocess] zip 批次模式: {len(gt_files)} 张 -> {len(chunks)} 批"
+    chunks = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
+    print(f"[preprocess] zip 批次模式: {len(items)} 张 -> {len(chunks)} 批"
           f"（batch_size={batch_size}, staging={staging_root}, 约需 "
           f"{(zip_workers + 2) * batch_size * _NPY_MB / 1024:.1f} GB staging 空间）")
 
     failures = []
     npy_pool = _make_pool(workers)
+    zip_cache = _zip_cache_ok(npy_pool)
     zip_pool = ThreadPoolExecutor(max_workers=max(1, zip_workers))
     pending = deque()  # (future, stage_dir)
     t0 = time.time()
@@ -171,13 +232,13 @@ def _run_zip_batches(gt_files, output_dir, vc_fixed, cfg, batch_size, workers,
 
             os.makedirs(stage_dir, exist_ok=True)
             # 1) 并行逆 ISP 写 staging
-            jobs = [(gt_path, os.path.join(stage_dir, Path(gt_path).stem + '.npy'),
-                     vc_fixed, cfg) for gt_path in chunk]
+            jobs = [(item, os.path.join(stage_dir, _item_stem(item) + '.npy'),
+                     vc_fixed, cfg, zip_cache) for item in chunk]
             failed_stems = set()
-            for gt_path, err in npy_pool.map(_process_one, jobs):
+            for item, err in npy_pool.map(_process_one, jobs):
                 if err is not None:
-                    failures.append((gt_path, err))
-                    failed_stems.add(Path(gt_path).stem)
+                    failures.append((item, err))
+                    failed_stems.add(_item_stem(item))
 
             # 2) 提交 zip 打包（与下一批 npy 生产并行）
             if len(chunk) == len(failed_stems):
@@ -185,8 +246,8 @@ def _run_zip_batches(gt_files, output_dir, vc_fixed, cfg, batch_size, workers,
                 continue
             pending.append((zip_pool.submit(_zip_dir, stage_dir, zip_path, zip_compress),
                             stage_dir))
-            for gt_path in chunk:
-                stem = Path(gt_path).stem
+            for item in chunk:
+                stem = _item_stem(item)
                 if stem not in failed_stems:
                     zip_map[stem] = zip_rel
 
@@ -208,10 +269,11 @@ def _run_zip_batches(gt_files, output_dir, vc_fixed, cfg, batch_size, workers,
 
 def run_preprocess(gt_dir: str, output_dir: str, cfg: dict, workers: int = 1,
                    zip_batch_size: int = 0, staging_dir: str = None,
-                   zip_compress: int = 1, zip_workers: int = 2):
+                   zip_compress: int = 1, zip_workers: int = 2,
+                   flare_bank_path: str = 'flare_templates/512/'):
     """基线离线预处理主入口。
 
-    gt_dir: 原始 GT 输入目录（*.png / *.jpg）
+    gt_dir: 输入源：GT 目录（*.png / *.jpg），或未解压的 merged_512.zip（zip 源模式）
     output_dir: 输出目录（linear_raw 或 batches/*.zip、manifest.json 将写于此）
     cfg: config dict (configs/degradation_baseline.yaml)
     workers: 并行进程数（1=串行，保持原行为；>1 并行加速，断点续跑/产物一致）
@@ -220,6 +282,7 @@ def run_preprocess(gt_dir: str, output_dir: str, cfg: dict, workers: int = 1,
     staging_dir: zip 模式下 npy 暂存目录（必须在本地系统盘；默认系统临时目录）
     zip_compress: zip 压缩级别 0-9（0=不压缩，速度最快；默认 1）
     zip_workers: zip 打包线程数（默认 2；staging 峰值 ≈ (zip_workers+2)*batch*3.2MB）
+    flare_bank_path: 眩光模板库路径（写入 manifest；相对 output_dir 或绝对）
     """
     os.makedirs(os.path.join(output_dir, 'linear_raw'), exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
@@ -242,45 +305,65 @@ def run_preprocess(gt_dir: str, output_dir: str, cfg: dict, workers: int = 1,
         'wb_gains': np.array([g_r_fixed, wb_cfg['g_gain'], g_b_fixed], dtype=np.float32),
     }
 
-    # 支持 png / jpg
-    gt_files = sorted(glob.glob(os.path.join(gt_dir, '*.png')) +
-                      glob.glob(os.path.join(gt_dir, '*.jpg')) +
-                      glob.glob(os.path.join(gt_dir, '*.jpeg')))
+    # 解析 GT 源（目录 or zip）
+    is_zip_source = gt_dir.lower().endswith('.zip')
+    zip_source_abs = os.path.abspath(gt_dir) if is_zip_source else None
+    if is_zip_source:
+        if not os.path.exists(gt_dir):
+            raise FileNotFoundError(f"GT zip 不存在: {gt_dir}")
+        with zipfile.ZipFile(gt_dir) as zf:
+            entries = [e for e in zf.namelist()
+                       if e.lower().endswith(('.png', '.jpg', '.jpeg')) and '/gt/' in e]
+        if not entries:
+            raise RuntimeError(f"zip 内未找到 */gt/*.png 条目: {gt_dir}")
+        items = sorted(f'{_ZIP_PREFIX}{zip_source_abs}!/{e}' for e in entries)
+        print(f"[preprocess] zip 源模式: {zip_source_abs}（{len(items)} 张 GT 条目）")
+    else:
+        items = sorted(glob.glob(os.path.join(gt_dir, '*.png')) +
+                       glob.glob(os.path.join(gt_dir, '*.jpg')) +
+                       glob.glob(os.path.join(gt_dir, '*.jpeg')))
 
     zip_map = None
     if zip_batch_size and zip_batch_size > 0:
         staging = staging_dir or os.path.join(tempfile.gettempdir(), 'hypir_preprocess_staging')
-        failures, zip_map = _run_zip_batches(gt_files, output_dir, vc_fixed, cfg,
+        failures, zip_map = _run_zip_batches(items, output_dir, vc_fixed, cfg,
                                              batch_size=int(zip_batch_size), workers=workers,
                                              staging_root=staging, zip_compress=zip_compress,
                                              zip_workers=zip_workers)
     else:
         # 传统松散模式
-        failures = _run_legacy(gt_files, output_dir, vc_fixed, cfg, workers)
+        failures = _run_legacy(items, output_dir, vc_fixed, cfg, workers)
 
     if failures:
         print(f"[preprocess] ⚠ {len(failures)} 张处理失败（均已跳过 manifest）：")
         for fp, err in failures[:10]:
-            print(f"    {Path(fp).name}: {err}")
+            print(f"    {_item_stem(fp)}: {err}")
 
     # 生成 manifest
-    generate_manifest(gt_dir, output_dir, cfg['preprocess_version'], zip_map=zip_map)
+    generate_manifest(items, output_dir, cfg['preprocess_version'], zip_map=zip_map,
+                      zip_source=zip_source_abs, flare_bank_path=flare_bank_path)
     print(f"[preprocess] done. manifest -> {os.path.join(output_dir, 'manifest.json')}")
 
 
-def generate_manifest(gt_dir: str, output_dir: str, version: str, zip_map: dict = None):
+def resolve_bank_dir(output_dir: str, flare_bank_path: str) -> str:
+    """把 manifest 的 flare_bank_path 解析为实际模板目录（绝对路径直接用，相对则相对 output_dir）。"""
+    return flare_bank_path if os.path.isabs(flare_bank_path) else os.path.join(output_dir, flare_bank_path)
+
+
+def generate_manifest(items, output_dir: str, version: str, zip_map: dict = None,
+                      zip_source: str = None, flare_bank_path: str = 'flare_templates/512/'):
     """生成 manifest.json。
 
+    items: GT 条目列表（目录路径或 'zip://<zip>!/<entry>'；由 run_preprocess 传入）
     zip_map: None 时为传统松散模式（沿用旧字段）；
              否则 {stem: 'batches/batch_XXXXX.zip'}，每条记录追加 'zip' 字段，
              且仅收录 zip_map 中包含的成功样本。
+    zip_source: 非 None 时表示 zip 源模式：记录 gt_zip+gt_arc（gt_path=None）
+    flare_bank_path: 眩光模板库的路径（相对 output_dir 或绝对；训练侧按此解析）
     """
     files = []
-    gt_files = sorted(glob.glob(os.path.join(gt_dir, '*.png')) +
-                      glob.glob(os.path.join(gt_dir, '*.jpg')) +
-                      glob.glob(os.path.join(gt_dir, '*.jpeg')))
-    for gt_path in gt_files:
-        name = Path(gt_path).stem
+    for item in items:
+        name = _item_stem(item)
         if zip_map is not None:
             zip_rel = zip_map.get(name)
             if zip_rel is None:
@@ -293,11 +376,14 @@ def generate_manifest(gt_dir: str, output_dir: str, version: str, zip_map: dict 
         record = {
             'name': name,
             'source_type': 'gt',
-            'gt_path': os.path.abspath(gt_path),
+            'gt_path': None if zip_source is not None else os.path.abspath(item),
             'flare3d_input_path': None,
             'flare3d_gt_path': None,
             'linear_raw': linear_raw_rel,
         }
+        if zip_source is not None:
+            record['gt_zip'] = zip_source
+            record['gt_arc'] = item.split('!/', 1)[1]
         if zip_rel is not None:
             record['zip'] = zip_rel
         files.append(record)
@@ -308,7 +394,7 @@ def generate_manifest(gt_dir: str, output_dir: str, version: str, zip_map: dict 
         'files': files,
         'psf_bank_version': None,
         'psf_bank_path': None,
-        'flare_bank_path': 'flare_templates/512/',
+        'flare_bank_path': flare_bank_path,
     }
     with open(os.path.join(output_dir, 'manifest.json'), 'w') as f:
         json.dump(manifest, f, indent=2)
@@ -355,7 +441,8 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(
         description='HYPIR 基线离线预处理（默认 zip 批次输出；--zip-batch-size 0 恢复松散模式）')
-    parser.add_argument('--gt_dir', required=True, help='原始 GT 输入目录')
+    parser.add_argument('--gt_dir', required=True,
+                        help='GT 源：目录 或 未解压的 merged_512.zip（zip 源模式）')
     parser.add_argument('--output_dir', required=True,
                         help='输出目录（zip 模式可直接指向 OSS 挂载路径；'
                              '传统模式为本地目录）')
@@ -365,8 +452,8 @@ if __name__ == '__main__':
                         help='生成 flare 模板数量')
     parser.add_argument('--workers', type=int, default=1,
                         help='并行进程数（默认 1=串行；建议设备核心数-1，如 8）')
-    parser.add_argument('--zip-batch-size', type=int, default=1024,
-                        help='zip 批次大小：每批样本数生成一个 batch_XXXXX.zip（默认 1024；'
+    parser.add_argument('--zip-batch-size', type=int, default=512,
+                        help='zip 批次大小：每批样本数生成一个 batch_XXXXX.zip（默认 512；'
                              '0=传统松散模式不打包）')
     parser.add_argument('--staging-dir', default=None,
                         help='zip 模式 npy 暂存目录（必须在本地系统盘；默认系统临时目录）')
@@ -374,6 +461,9 @@ if __name__ == '__main__':
                         help='zip 压缩级别 0-9（默认 1；0=不压缩最快）')
     parser.add_argument('--zip-workers', type=int, default=2,
                         help='zip 打包线程数（默认 2；staging 峰值≈(zip_workers+2)*batch*3.2MB）')
+    parser.add_argument('--flare-bank-path', default='flare_templates/512/',
+                        help='眩光模板库路径，写入 manifest（相对 output_dir 或绝对；'
+                             '默认 flare_templates/512/；训练侧据此解析）')
     args = parser.parse_args()
 
     cfg_path = args.config or os.path.join(_project_root(), 'configs/degradation_baseline.yaml')
@@ -382,10 +472,12 @@ if __name__ == '__main__':
 
     run_preprocess(args.gt_dir, args.output_dir, cfg, workers=args.workers,
                    zip_batch_size=args.zip_batch_size, staging_dir=args.staging_dir,
-                   zip_compress=args.zip_compress, zip_workers=args.zip_workers)
+                   zip_compress=args.zip_compress, zip_workers=args.zip_workers,
+                   flare_bank_path=args.flare_bank_path)
 
-    # 若无 flare 模板，生成占位模板
-    flare_dir = os.path.join(args.output_dir, 'flare_templates', '512')
-    if not glob.glob(os.path.join(flare_dir, '*.npy')):
+    # 若无 flare 模板，生成占位模板（路径跟随 flare_bank_path）
+    flare_dir = resolve_bank_dir(args.output_dir, args.flare_bank_path)
+    if not glob.glob(os.path.join(flare_dir, '*.npy')) and \
+            not glob.glob(os.path.join(flare_dir, 'batch_*.zip')):
         print(f"[preprocess] generating {args.num_templates} flare templates -> {flare_dir}")
         generate_flare_templates(flare_dir, args.num_templates)

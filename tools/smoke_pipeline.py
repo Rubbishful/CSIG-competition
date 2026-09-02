@@ -13,8 +13,9 @@
     # 对比多个 batch 大小的预处理耗时/产物大小
     python tools/smoke_pipeline.py --num-samples 128 --batch-trials 32,64,128,256
 
-    # 跑 4 步真实训练（首次会下载 SD2 base 权重约 5GB）
-    python tools/smoke_pipeline.py --num-samples 64 --batch-size 64 --train-steps 4
+    # 跑 4 步真实训练（场景线：SceneDegradationDataset 跑 zip 产物；首次会下载 SD2 base 权重约 5GB）
+    python tools/smoke_pipeline.py --num-samples 64 --batch-size 64 --train-steps 4 \
+        --train-backend scene
 
 说明：
   - 只解压选中样本到本地 work-dir（不解压整个 zip），系统盘占用 ≈ 少量 PNG + staging；
@@ -215,36 +216,53 @@ def validate_zip_flow(work_dir, expected_names):
 # 4. 可选真实短训（SD2 + RealESRGANDataset）
 # ---------------------------------------------------------------------------- #
 
-def run_short_training(work_dir, num_steps):
+def run_short_training(work_dir, num_steps, backend="scene"):
     import yaml
-    with open(os.path.join(REPO_ROOT, "configs", "sd2_train.yaml"), encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+    if backend == "scene":
+        # 场景退化合成线：SceneDegradationDataset -> SD2Trainer（zip 批次产物入口）
+        with open(os.path.join(REPO_ROOT, "configs", "sd2_scene_train.yaml"), encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        cfg["output_dir"] = os.path.join(work_dir, "train_scene_out")
+        cfg["logging_dir"] = "logs"
+        cfg["max_train_steps"] = int(num_steps)
+        cfg["resume_from_checkpoint"] = None
+        cfg["data_config"]["train"]["batch_size"] = 2
+        cfg["data_config"]["train"]["dataloader_num_workers"] = 2
+        cfg["data_config"]["train"]["dataset"]["params"]["manifest_path"] = \
+            os.path.join(work_dir, "preprocessed", "manifest.json")
+        cfg["data_config"]["train"]["dataset"]["params"]["cfg_path"] = \
+            os.path.join(REPO_ROOT, "configs", "degradation_baseline.yaml")
+        log(f"场景线训练配置生成（manifest={cfg['data_config']['train']['dataset']['params']['manifest_path']}）")
+    else:
+        with open(os.path.join(REPO_ROOT, "configs", "sd2_train.yaml"), encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
 
-    gt_dir = os.path.join(work_dir, "gt")
-    file_list = os.path.join(work_dir, "file_list.txt")
-    with open(file_list, "w", encoding="utf-8") as f:
-        for n in sorted(os.listdir(gt_dir)):
-            if n.endswith(".png"):
-                f.write(os.path.abspath(os.path.join(gt_dir, n)) + "\n")
+        gt_dir = os.path.join(work_dir, "gt")
+        file_list = os.path.join(work_dir, "file_list.txt")
+        with open(file_list, "w", encoding="utf-8") as f:
+            for n in sorted(os.listdir(gt_dir)):
+                if n.endswith(".png"):
+                    f.write(os.path.abspath(os.path.join(gt_dir, n)) + "\n")
 
-    cfg["output_dir"] = os.path.join(work_dir, "train_out")
-    cfg["logging_dir"] = "logs"
-    cfg["max_train_steps"] = int(num_steps)
-    cfg["resume_from_checkpoint"] = None
-    cfg["data_config"]["train"]["batch_size"] = 2
-    cfg["data_config"]["train"]["dataloader_num_workers"] = 2
-    cfg["data_config"]["train"]["dataset"]["params"]["file_meta"] = {
-        "file_list": file_list,
-        "image_path_prefix": "",
-        "image_path_key": "path",
-        "prompt_key": "prompt",
-    }
-    cfg["data_config"]["train"]["dataset"]["params"]["crop_type"] = "none"
+        cfg["output_dir"] = os.path.join(work_dir, "train_out")
+        cfg["logging_dir"] = "logs"
+        cfg["max_train_steps"] = int(num_steps)
+        cfg["resume_from_checkpoint"] = None
+        cfg["data_config"]["train"]["batch_size"] = 2
+        cfg["data_config"]["train"]["dataloader_num_workers"] = 2
+        cfg["data_config"]["train"]["dataset"]["params"]["file_meta"] = {
+            "file_list": file_list,
+            "image_path_prefix": "",
+            "image_path_key": "path",
+            "prompt_key": "prompt",
+        }
+        cfg["data_config"]["train"]["dataset"]["params"]["crop_type"] = "none"
+
     train_cfg = os.path.join(work_dir, "train_config.yaml")
     with open(train_cfg, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, default_flow_style=None)
 
-    log(f"生成训练配置: {train_cfg}（max_train_steps={num_steps}）")
+    log(f"生成训练配置: {train_cfg}（backend={backend}, max_train_steps={num_steps}）")
     dt, _ = run_subprocess(
         [sys.executable, "train.py", "--config", train_cfg],
         cwd=REPO_ROOT, desc="短训（train.py）")
@@ -304,7 +322,10 @@ def main():
     parser.add_argument("--zip-compress", type=int, default=1, choices=range(0, 10),
                         help="zip 压缩级别（默认 1）")
     parser.add_argument("--train-steps", type=int, default=0,
-                        help=">0 时运行 train.py 短训 N 步（首次需下载 SD2 base 权重）")
+                        help=">0 时运行 train.py 短训 N 步（首次需下载 SD2 base 权重约 5GB）")
+    parser.add_argument("--train-backend", choices=["scene", "realesrgan"], default="scene",
+                        help="短训数据入口：scene=SceneDegradationDataset(zip 批次, 默认)；"
+                             "realesrgan=RealESRGANDataset(解压 GT 在线退化)")
     parser.add_argument("--clean", action="store_true",
                         help="验证通过后清理 work-dir 下的 gt 与 trials")
     args = parser.parse_args()
@@ -327,9 +348,9 @@ def main():
     log(f"预处理 zip 批次模式验证通过: {out_dir}")
 
     if args.train_steps > 0:
-        run_short_training(args.work_dir, args.train_steps)
+        run_short_training(args.work_dir, args.train_steps, args.train_backend)
     else:
-        log("跳过真实训练（加 --train-steps 4 可跑 4 步短训验证训练链路与显存）")
+        log("跳过真实训练（加 --train-steps 4 --train-backend scene 可跑 4 步场景线短训）")
 
     if args.clean:
         shutil.rmtree(os.path.join(args.work_dir, "gt"), ignore_errors=True)

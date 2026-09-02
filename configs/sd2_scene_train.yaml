@@ -1,0 +1,63 @@
+# 场景退化合成管线训练配置（zip 批次产物 -> SceneDegradationDataset -> SD2Trainer）
+# 与 sd2_train.yaml 的区别仅在数据入口：退化由 SceneDegradation 现算（离线逆 ISP 产物做 GT），
+# 其余训练设置（模型/损失/优化器/调度）完全一致。
+#
+# 用法：
+#   先运行预处理生成数据集：
+#     python -m HYPIR.dataset.preprocess --gt_dir /mnt/data/merged_512.zip \
+#         --output_dir /mnt/data/dataset --zip-batch-size 512 --workers 8
+#   再训练：
+#     python train.py --config configs/sd2_scene_train.yaml
+
+output_dir: TODO
+
+data_config:
+  train:
+    batch_size: 6
+    dataloader_num_workers: 2
+    dataset:
+      target: HYPIR.dataset.scene_degradation_dataset.SceneDegradationDataset
+      params:
+        manifest_path: /mnt/data/dataset/manifest.json   # 预处理产物（zip 批次模式）
+        cfg_path: configs/degradation_baseline.yaml      # 退化基线配置
+        zip_manifest: true        # true: 经 ZipBatchStore 读 linear_raw（zip 句柄 LRU）
+        return_gt: true           # 尽力读原始 GT（zip 源模式）；否则高保真重建
+        base_seed: 0              # 样本级退化链 RNG 种子流基准
+        zip_cache_size: 4
+    batch_transform:
+      target: HYPIR.dataset.scene_degradation_dataset.SceneBatchTransform
+      params: {}
+
+base_model_type: sd2
+base_model_path: stabilityai/stable-diffusion-2-1-base
+model_t: 200
+coeff_t: 200
+lora_rank: 256
+lora_modules: [to_k, to_q, to_v, to_out.0, conv, conv1, conv2, conv_shortcut, conv_out, proj_in, proj_out, ff.net.2, ff.net.0.proj]
+use_ema: true
+ema_decay: 0.999
+resume_ema: true
+
+lambda_gan: 0.5
+lambda_lpips: 5
+lambda_l2: 1
+lr_G: 1e-5
+lr_D: 1e-5
+optimizer_type: adam
+opt_kwargs:
+  betas: [0.9, 0.999]
+
+mixed_precision: bf16
+seed: 231
+max_train_steps: 30000
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+max_grad_norm: 1.0
+logging_dir: logs
+report_to: tensorboard
+checkpointing_steps: 500
+checkpoints_total_limit: 2
+resume_from_checkpoint: ~
+log_image_steps: 100
+log_grad_steps: 100
+log_grad_modules: [conv_out]
