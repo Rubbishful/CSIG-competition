@@ -72,10 +72,12 @@ def select_and_extract(zip_path, work_dir, num_samples, seed):
     log(f"扫描压缩包: {zip_path}")
     with zipfile.ZipFile(zip_path) as zf:
         entries = zf.namelist()
-        png_entries = [e for e in entries if e.endswith(".png") and "/gt/" in e]
+        # merged_512.zip 即切片图集：任意图片条目视为 GT 图（条目常为 'gt/<id>.png'，
+        # 不能用要求嵌套路径的 '/gt/' 子串匹配）
+        png_entries = [e for e in entries if e.lower().endswith((".png", ".jpg", ".jpeg"))]
         if not png_entries:
             raise RuntimeError(
-                f"压缩包中未找到 *gt/*.png 条目（共 {len(entries)} 个条目），示例: {entries[:5]}")
+                f"压缩包中未找到图片条目（共 {len(entries)} 个条目），示例: {entries[:5]}")
         rng = random.Random(seed)
         chosen = rng.sample(png_entries, min(num_samples, len(png_entries)))
 

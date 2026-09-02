@@ -312,12 +312,19 @@ def run_preprocess(gt_dir: str, output_dir: str, cfg: dict, workers: int = 1,
         if not os.path.exists(gt_dir):
             raise FileNotFoundError(f"GT zip 不存在: {gt_dir}")
         with zipfile.ZipFile(gt_dir) as zf:
-            entries = [e for e in zf.namelist()
-                       if e.lower().endswith(('.png', '.jpg', '.jpeg')) and '/gt/' in e]
+            all_entries = zf.namelist()
+            # merged_512.zip 即切片图集：任意图片条目都是 GT 图。
+            # 注意：条目常为 'gt/00000000.png'（gt 在最前、无前导/），
+            # 不能用 '/gt/' 这种要求嵌套路径的子串匹配。
+            entries = [e for e in all_entries
+                       if e.lower().endswith(('.png', '.jpg', '.jpeg'))]
         if not entries:
-            raise RuntimeError(f"zip 内未找到 */gt/*.png 条目: {gt_dir}")
+            raise RuntimeError(
+                f"zip 内未找到图片条目（共 {len(all_entries)} 个条目）: {gt_dir}\n"
+                f"  样例条目: {all_entries[:8]}")
         items = sorted(f'{_ZIP_PREFIX}{zip_source_abs}!/{e}' for e in entries)
-        print(f"[preprocess] zip 源模式: {zip_source_abs}（{len(items)} 张 GT 条目）")
+        print(f"[preprocess] zip 源模式: {zip_source_abs}（{len(items)} 张 GT 图，"
+              f"如 {entries[0]} ...）")
     else:
         items = sorted(glob.glob(os.path.join(gt_dir, '*.png')) +
                        glob.glob(os.path.join(gt_dir, '*.jpg')) +
