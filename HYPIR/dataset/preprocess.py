@@ -163,20 +163,26 @@ def _run_legacy(items, output_dir, vc_fixed, cfg, workers):
     return failures
 
 
-def _zip_dir(stage_dir, zip_path, compresslevel):
-    """把 staging 目录下的 *.npy 打成 zip（arcname 前缀 linear_raw/）。返回 (zip_path, size)。"""
-    tmp_path = zip_path + '.tmp'
+def _zip_dir(stage_dir, zip_path, compresslevel, work_dir):
+    """把 staging 目录下的 *.npy 打成 zip（arcname 前缀 linear_raw/）。
+
+    zip 必须在本地 work_dir（可 seek）构建，再 copyfile 到 zip_path：
+    output_dir 可能是 OSS 挂载（fuse 不支持 zipfile 构建所需的 seek-back，
+    直接写会抛 OSError: [Errno 22] Invalid argument）。返回 (zip_path, size)。
+    """
+    local_zip = os.path.join(work_dir, os.path.basename(zip_path))
     try:
-        with zipfile.ZipFile(tmp_path, 'w') as zf:
+        with zipfile.ZipFile(local_zip, 'w') as zf:
             for name in sorted(os.listdir(stage_dir)):
                 if not name.endswith('.npy'):
                     continue
                 zf.write(os.path.join(stage_dir, name), arcname=f'linear_raw/{name}')
-        os.replace(tmp_path, zip_path)
-        return (zip_path, os.path.getsize(zip_path))
+        size = os.path.getsize(local_zip)
+        shutil.copyfile(local_zip, zip_path)  # 跨设备复制（OSS 为 copyfile/写，非 rename）
+        return (zip_path, size)
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        if os.path.exists(local_zip):
+            os.remove(local_zip)
 
 
 def _run_zip_batches(items, output_dir, vc_fixed, cfg, batch_size, workers,
@@ -188,18 +194,19 @@ def _run_zip_batches(items, output_dir, vc_fixed, cfg, batch_size, workers,
     os.makedirs(batches_dir, exist_ok=True)
     os.makedirs(staging_root, exist_ok=True)
 
-    # 断点续跑：已存在的 zip 记录其内容
+    # 断点续跑：用侧车索引记录 name->zip（避免打开 OSS 上的 zip 做中间目录 seek 读）
+    index_path = os.path.join(batches_dir, '_zip_index.json')
     zip_map = {}  # stem -> 'batches/batch_XXXXX.zip'
     existing_zip_paths = set()
-    for zp in sorted(glob.glob(os.path.join(batches_dir, 'batch_*.zip'))):
+    if os.path.exists(index_path):
         try:
-            with zipfile.ZipFile(zp) as zf:
-                for n in zf.namelist():
-                    if n.endswith('.npy'):
-                        zip_map[Path(n).stem] = os.path.relpath(zp, output_dir).replace('\\', '/')
-            existing_zip_paths.add(zp)
-        except zipfile.BadZipFile:
-            print(f"⚠ 跳过损坏 zip: {zp}")
+            with open(index_path) as f:
+                zip_map = json.load(f)
+        except Exception as exc:
+            print(f"⚠ 读取 _zip_index.json 失败（{exc}），按空索引处理")
+            zip_map = {}
+    # 只按文件名跳过已生成批次，不读其内容
+    existing_zip_paths = set(sorted(glob.glob(os.path.join(batches_dir, 'batch_*.zip'))))
 
     chunks = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
     print(f"[preprocess] zip 批次模式: {len(items)} 张 -> {len(chunks)} 批"
@@ -244,12 +251,17 @@ def _run_zip_batches(items, output_dir, vc_fixed, cfg, batch_size, workers,
             if len(chunk) == len(failed_stems):
                 shutil.rmtree(stage_dir, ignore_errors=True)
                 continue
-            pending.append((zip_pool.submit(_zip_dir, stage_dir, zip_path, zip_compress),
+            pending.append((zip_pool.submit(_zip_dir, stage_dir, zip_path, zip_compress,
+                                            staging_root),
                             stage_dir))
             for item in chunk:
                 stem = _item_stem(item)
                 if stem not in failed_stems:
                     zip_map[stem] = zip_rel
+
+            # 增量持久化索引（便于 OSS 场景断点续跑时不读 zip 内容）
+            with open(index_path, 'w') as f:
+                json.dump(zip_map, f)
 
             print(f"[preprocess] 批次 {batch_id}: {len(chunk) - len(failed_stems)}/{len(chunk)} 张已入队")
 
