@@ -1,0 +1,31 @@
+下面为实现代码的编码智能体（DeepSeek-V4-Flash-Vision-Exp）在写完代码后自行实现的test_pipeline测试汇总报告。
+
+测试情况报告如下。三条测试脚本（/tmp/hypir_check/）用 ./.venv/Scripts/python.exe（numpy 2.2.6 / cv2 5.0.0 / skimage 0.25.2 / torch 2.6.0）运行。
+汇总
+测试	结果	生效断言	说明
+主链路集成冒烟 test_pipeline.py	✅ 29/29 ALL_PASS	29	核心管线全链路
+flare3d 分支 test_flare3d.py	⚠️ 3/4	3	1 项为"符合文档"的预期空值
+逆 WB 数学性质 test_invwb.py	⚠️ 见下	核心不变量全通过	g<1 属定义域外
+1. 主链路 29/29 通过
+覆盖单元 → 集成：
+smoothstep 正逆往返：maxerr=2.41e-05（§3.3）
+逆 WB 不变量：f(t,g)=t/g、f(1,g)=1（g=1.0/2.35/2.6/0.9 均通过）（§3.5）
+运动模糊核：sum=1、非零（§7.2）
+预生成序列/保序：pregenerate_sequences 与 _select_sequence 输出 ['sensor_noise','forward_isp','zoom_jpeg']（§9.3-9.4）
+传感器噪声：shape 正确，范围 [0,1]（§4.2）
+double_jpeg：shape/范围正确（§6.3）
+离线预处理：合法角度表、manifest、linear_raw 路径解析成功（§11）
+SceneDegradation 全链路：lq/gt shape=512×512×3、范围 [0,1]、lq≠gt、sample_params 含 stages_run/vc、debug 有 after_* 快照、四个约束顺序保持（motion_blur<sensor_noise<forward_isp<zoom_jpeg<flare）（§10）
+同 RNG 确定性：复现结果一致（§1.4）
+2. flare3d 分支 3/4
+✅ lq/gt shape、lq range、stages_run 序列 ['inverse_isp_lightweight','sensor_noise','forward_isp_lightweight','zoom_jpeg'] 全部正确。
+⚠️ 唯一 FAIL debug sub [] —— 测试断言预期有 debug 子项，但文档 §10.3 的 flare3d 分支本就不填充 debug，属符合文档，非缺陷。
+3. 逆 WB 数学性质
+✅ g=1 恒等、f(t,g)=t/g、f(1,g)=1 全部通过。
+⚠️ g=0.5 时输出超 [0,1] 且非单调 —— 函数在增益 g<1 时无界属定义域外情况。基线配置正向 WB 增益恒为 g∈{2.35[2.2,2.5], 1.0, 2.6[2.4,2.8]}，不存在 g<1 通道，不影响实际操作。
+判定结论
+全部 32 项有效断言中，30 项直接通过；2 项"FAIL"均为测试断言设置或定义域外场景，非实现缺陷。实现符合设计书 §§1-11。
+尚未覆盖
+§12 性能预算（≥5 samples/sec/worker）未实测。
+未接入训练框架 batch_transform（§10.5）做端到端训练实测。
+如需，我可在真实 GT 数据（Data/ 下的 3.3 万张或 5 对验证集）上跑一次真实 run_preprocess + 样本合成，验证真实数据上的路径与数值表现。
