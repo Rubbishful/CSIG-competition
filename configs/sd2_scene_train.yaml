@@ -30,6 +30,8 @@ data_config:
 
 base_model_type: sd2
 base_model_path: HYPIR_model/sd2-1-base   # 本地缓存 SD2 base（Diffusers 目录），避免联网下载
+g_pretrain_path: HYPIR_model/HYPIR_sd2.pth        # 官方 G LoRA 权重（续训基础）
+d_pretrain_path: HYPIR_model/HYPIR_sd2_D.safetensors  # 官方判别器可训头权重（续训基础）
 model_t: 200
 coeff_t: 200
 lora_rank: 256

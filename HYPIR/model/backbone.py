@@ -1,7 +1,14 @@
+import os
 import torch
 from torch import nn
 import open_clip
 from open_clip.factory import CLIP
+
+# 项目根（HYPIR/model -> HYPIR -> 仓库根）
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+# 手动下载的 convnext_xxlarge open_clip 权重停放位置（存在则完全离线加载）
+_LOCAL_CONVNEXT = os.path.join(_REPO_ROOT, 'HYPIR_model', 'convnext_xxlarge',
+                               'open_clip_pytorch_model.bin')
 
 
 def _visual_forward(
@@ -32,11 +39,15 @@ def _visual_forward(
 
 class ImageOpenCLIPConvNext(nn.Module):
 
-    def __init__(self, precision="fp32"):
+    def __init__(self, precision="fp32", pretrained=None):
         super().__init__()
+        if pretrained is None:
+            # 优先读取本地手动下载的权重（免联网）；否则用公开 tag（联网下载）
+            pretrained = _LOCAL_CONVNEXT if os.path.isfile(_LOCAL_CONVNEXT) \
+                else "laion2b_s34b_b82k_augreg_soup"
         self.model, _, _ = open_clip.create_model_and_transforms(
             "convnext_xxlarge",
-            pretrained="laion2b_s34b_b82k_augreg_soup",
+            pretrained=pretrained,
             precision=precision,
         )
 

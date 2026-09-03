@@ -76,7 +76,16 @@ def check_train_prereq(env):
         env.setdefault("TRANSFORMERS_OFFLINE", "1")
         log(f"提示: 使用本地 SD2 base（{local_model}），已设离线模式，无需下载")
         return True
-    # ② HuggingFace 缓存
+    # ② 判别器 backbone（open_clip convnext_xxlarge）本地文件检查
+    conx = os.path.join(REPO_ROOT, "HYPIR_model", "convnext_xxlarge", "open_clip_pytorch_model.bin")
+    if os.path.isfile(conx):
+        log(f"提示: 判别器 convnext_xxlarge 本地权重就绪（{conx}）")
+    else:
+        log("⚠ 提示: 未找到判别器 backbone 本地权重（HYPIR_model/convnext_xxlarge/"
+            "open_clip_pytorch_model.bin），训练时会在 init_discriminator 联网下载约数 GB；"
+            "建议手动下载 open_clip_pytorch_model.bin（源 laion/CLIP-convnext_xxlarge-"
+            "laion2B-s34B-b82K-augreg-soup）放到该位置。")
+    # ③ HuggingFace 缓存
     hub_dir = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
     base_pattern = os.path.join(hub_dir, "models--stabilityai--stable-diffusion-2-1-base", "snapshots", "*")
     if bool(glob.glob(base_pattern)):
@@ -263,10 +272,12 @@ def run_short_training(work_dir, num_steps, backend="scene"):
             os.path.join(work_dir, "preprocessed", "manifest.json")
         cfg["data_config"]["train"]["dataset"]["params"]["cfg_path"] = \
             os.path.join(REPO_ROOT, "configs", "degradation_baseline.yaml")
-        # 本地 SD2 base（绝对路径，避免 cwd/联网问题）
+        # 本地 SD2 base + 官方预训练权重（绝对路径，避免 cwd/联网问题）
         cfg["base_model_path"] = os.path.join(REPO_ROOT, "HYPIR_model", "sd2-1-base")
+        cfg["g_pretrain_path"] = os.path.join(REPO_ROOT, "HYPIR_model", "HYPIR_sd2.pth")
+        cfg["d_pretrain_path"] = os.path.join(REPO_ROOT, "HYPIR_model", "HYPIR_sd2_D.safetensors")
         log(f"场景线训练配置生成（manifest={cfg['data_config']['train']['dataset']['params']['manifest_path']}，"
-            f"base_model={cfg['base_model_path']}）")
+            f"base_model={cfg['base_model_path']}，g_pretrain={cfg['g_pretrain_path']}）")
     else:
         with open(os.path.join(REPO_ROOT, "configs", "sd2_train.yaml"), encoding="utf-8") as f:
             cfg = yaml.safe_load(f)

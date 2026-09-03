@@ -57,6 +57,16 @@ class SD2Trainer(BaseTrainer):
         for p in lora_params:
             p.data = p.to(torch.float32)
 
+        # 官方 G LoRA 预训练权重（续训用，strict=False 只匹配 LoRA 键）
+        g_pretrain = getattr(self.config, 'g_pretrain_path', None)
+        if g_pretrain and os.path.exists(g_pretrain):
+            state_dict = torch.load(g_pretrain, map_location="cpu", weights_only=False)
+            missing, unexpected = self.G.load_state_dict(state_dict, strict=False)
+            logger.info(f"Loaded G pretrain from {g_pretrain}: "
+                        f"missing={len(missing)} unexpected={len(unexpected)}")
+            print(f"[train] 生成器加载官方 LoRA 预训练: {g_pretrain}"
+                  f"（missing {len(missing)} / unexpected {len(unexpected)}）", flush=True)
+
     def attach_accelerator_hooks(self):
         def save_model_hook(models, weights, output_dir):
             if self.accelerator.is_main_process:

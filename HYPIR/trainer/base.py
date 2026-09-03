@@ -147,6 +147,17 @@ class BaseTrainer:
             self.D = ImageConvNextDiscriminator(precision="bf16").to(device=self.device)
         self.D.train().requires_grad_(True)
 
+        # 预加载官方判别器权重（可训头 decoder），用于续训（strict=False，骨架冻结不动）
+        d_pretrain = getattr(self.config, 'd_pretrain_path', None)
+        if d_pretrain and os.path.exists(d_pretrain):
+            import safetensors.torch as st
+            sd = st.load_file(d_pretrain)
+            missing, unexpected = self.D.load_state_dict(sd, strict=False)
+            logger.info(f"Loaded D pretrain from {d_pretrain}: "
+                        f"missing={len(missing)} unexpected={len(unexpected)}")
+            print(f"[train] 判别器加载预训练权重: {d_pretrain}"
+                  f"（missing {len(missing)} / unexpected {len(unexpected)}）", flush=True)
+
     def summary_models(self):
         table_data = []
         for attr, value in self.__dict__.items():
