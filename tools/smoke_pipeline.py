@@ -67,19 +67,26 @@ def run_subprocess(cmd, cwd, desc, env=None):
 
 
 def check_train_prereq(env):
-    """预检训练前提：SD2 base 模型是否已在 HF 缓存，避免 train.py 静默下载卡住。"""
+    """预检训练前提：SD2 base 模型本地是否可用，避免 train.py 联网下载卡住。"""
     import glob
+    # ① 仓库内本地 Diffusers 模型目录（优先）
+    local_model = os.path.join(REPO_ROOT, "HYPIR_model", "sd2-1-base")
+    if os.path.isfile(os.path.join(local_model, "model_index.json")):
+        env.setdefault("HF_HUB_OFFLINE", "1")
+        env.setdefault("TRANSFORMERS_OFFLINE", "1")
+        log(f"提示: 使用本地 SD2 base（{local_model}），已设离线模式，无需下载")
+        return True
+    # ② HuggingFace 缓存
     hub_dir = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
     base_pattern = os.path.join(hub_dir, "models--stabilityai--stable-diffusion-2-1-base", "snapshots", "*")
-    cached = bool(glob.glob(base_pattern))
-    if cached:
+    if bool(glob.glob(base_pattern)):
         env.setdefault("HF_HUB_OFFLINE", "1")
         env.setdefault("TRANSFORMERS_OFFLINE", "1")
         log("提示: SD2 base 已在 HF 缓存，使用离线模式加载（HF_HUB_OFFLINE=1）")
-    else:
-        log("⚠ 提示: 本地未缓存 SD2 base（stabilityai/stable-diffusion-2-1-base），"
-            "train.py 将联网下载约 5GB；若网络不可达/超时会导致卡住。")
-    return cached
+        return True
+    log("⚠ 提示: 未找到本地 SD2 base（HYPIR_model/sd2-1-base 或 HF 缓存），"
+        "train.py 将联网下载约 5GB；若网络不可达/超时会导致卡住。")
+    return False
 
 
 # ---------------------------------------------------------------------------- #
@@ -256,7 +263,10 @@ def run_short_training(work_dir, num_steps, backend="scene"):
             os.path.join(work_dir, "preprocessed", "manifest.json")
         cfg["data_config"]["train"]["dataset"]["params"]["cfg_path"] = \
             os.path.join(REPO_ROOT, "configs", "degradation_baseline.yaml")
-        log(f"场景线训练配置生成（manifest={cfg['data_config']['train']['dataset']['params']['manifest_path']}）")
+        # 本地 SD2 base（绝对路径，避免 cwd/联网问题）
+        cfg["base_model_path"] = os.path.join(REPO_ROOT, "HYPIR_model", "sd2-1-base")
+        log(f"场景线训练配置生成（manifest={cfg['data_config']['train']['dataset']['params']['manifest_path']}，"
+            f"base_model={cfg['base_model_path']}）")
     else:
         with open(os.path.join(REPO_ROOT, "configs", "sd2_train.yaml"), encoding="utf-8") as f:
             cfg = yaml.safe_load(f)

@@ -29,7 +29,7 @@ data_config:
       params: {}
 
 base_model_type: sd2
-base_model_path: stabilityai/stable-diffusion-2-1-base
+base_model_path: HYPIR_model/sd2-1-base   # 本地缓存 SD2 base（Diffusers 目录），避免联网下载
 model_t: 200
 coeff_t: 200
 lora_rank: 256
