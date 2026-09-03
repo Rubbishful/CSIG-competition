@@ -1,6 +1,7 @@
 import logging
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import overload, List, Dict
 import importlib
@@ -55,12 +56,13 @@ class BaseTrainer:
     def __init__(self, config):
         self.config = config
         set_seed(config.seed)
-        self.init_environment()
-        self.init_models()
-        self.summary_models()
-        self.init_optimizers()
-        self.init_dataset()
-        self.prepare_all()
+        # 逐阶段计时诊断：启动若卡住，能立即看到停在哪一步
+        for step in ["init_environment", "init_models", "summary_models",
+                     "init_optimizers", "init_dataset", "prepare_all"]:
+            t0 = time.time()
+            print(f"[train] 阶段 {step} ...", flush=True)
+            getattr(self, step)()
+            print(f"[train] {step} 完成 in {time.time() - t0:.1f}s", flush=True)
 
     def init_environment(self):
         logging_dir = Path(self.config.output_dir, self.config.logging_dir)
@@ -98,12 +100,13 @@ class BaseTrainer:
         return model
 
     def init_models(self):
-        self.init_scheduler()
-        self.init_text_models()
-        self.init_vae()
-        self.init_generator()
-        self.init_discriminator()
-        self.init_lpips()
+        # 逐子阶段计时：定位卡在哪个模型加载（SD2 base / LPIPS 会联网）
+        for sub in ["init_scheduler", "init_text_models", "init_vae",
+                    "init_generator", "init_discriminator", "init_lpips"]:
+            t0 = time.time()
+            print(f"[train]   加载 {sub} ...", flush=True)
+            getattr(self, sub)()
+            print(f"[train]   {sub} 完成 in {time.time() - t0:.1f}s", flush=True)
 
     @overload
     def init_scheduler(self):

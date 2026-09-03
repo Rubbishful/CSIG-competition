@@ -46,18 +46,40 @@ def log(msg):
     print(f"[smoke] {msg}", flush=True)
 
 
-def run_subprocess(cmd, cwd, desc):
+def run_subprocess(cmd, cwd, desc, env=None):
+    """流式运行子进程：实时打印 stdout（train.py 卡住时能立即看到卡在哪一步）。"""
     log(f"运行: {' '.join(cmd)}")
     t0 = time.time()
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1,
+                            env=env)
+    out_lines = []
+    for line in proc.stdout:
+        print(f"    | {line.rstrip()}", flush=True)
+        out_lines.append(line)
+    proc.wait()
     dt = time.time() - t0
-    out = (proc.stdout or "") + (proc.stderr or "")
-    tail = out.strip().splitlines()[-25:]
-    for line in tail:
-        print(f"    | {line}")
+    out_text = ''.join(out_lines)
     if proc.returncode != 0:
         raise RuntimeError(f"{desc} 失败（exit={proc.returncode}），完整输出见上方")
-    return dt, out
+    log(f"{desc} 完成，耗时 {dt:.1f}s")
+    return dt, out_text
+
+
+def check_train_prereq(env):
+    """预检训练前提：SD2 base 模型是否已在 HF 缓存，避免 train.py 静默下载卡住。"""
+    import glob
+    hub_dir = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
+    base_pattern = os.path.join(hub_dir, "models--stabilityai--stable-diffusion-2-1-base", "snapshots", "*")
+    cached = bool(glob.glob(base_pattern))
+    if cached:
+        env.setdefault("HF_HUB_OFFLINE", "1")
+        env.setdefault("TRANSFORMERS_OFFLINE", "1")
+        log("提示: SD2 base 已在 HF 缓存，使用离线模式加载（HF_HUB_OFFLINE=1）")
+    else:
+        log("⚠ 提示: 本地未缓存 SD2 base（stabilityai/stable-diffusion-2-1-base），"
+            "train.py 将联网下载约 5GB；若网络不可达/超时会导致卡住。")
+    return cached
 
 
 # ---------------------------------------------------------------------------- #
@@ -265,9 +287,12 @@ def run_short_training(work_dir, num_steps, backend="scene"):
         yaml.safe_dump(cfg, f, default_flow_style=None)
 
     log(f"生成训练配置: {train_cfg}（backend={backend}, max_train_steps={num_steps}）")
+    # 预检模型缓存/网络，并传环境变量加载
+    env = dict(os.environ)
+    check_train_prereq(env)
     dt, _ = run_subprocess(
         [sys.executable, "train.py", "--config", train_cfg],
-        cwd=REPO_ROOT, desc="短训（train.py）")
+        cwd=REPO_ROOT, desc="短训（train.py）", env=env)
     log(f"短训完成: {dt:.1f}s，产物在 {cfg['output_dir']}")
     log("提示: 训练日志中的 'VRAM peak' 可用于评估 batch/zip 大小对显存的影响")
     return True
